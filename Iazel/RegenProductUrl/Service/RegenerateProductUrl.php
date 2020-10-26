@@ -4,9 +4,15 @@ declare(strict_types=1);
 
 namespace Iazel\RegenProductUrl\Service;
 
+use Exception;
+use Magento\Catalog\Model\Product;
+use Magento\Catalog\Model\Product\Attribute\Source\Status;
 use Magento\Catalog\Model\Product\Visibility;
 use Magento\Catalog\Model\ResourceModel\Product\CollectionFactory;
 use Magento\CatalogUrlRewrite\Model\ProductUrlRewriteGenerator;
+use Magento\Framework\EntityManager\EventManager;
+use Magento\Framework\Exception\NoSuchEntityException;
+use Magento\Framework\Indexer\CacheContextFactory;
 use Magento\Store\Model\Store;
 use Magento\Store\Model\StoreManagerInterface;
 use Magento\UrlRewrite\Model\UrlPersistInterface;
@@ -41,23 +47,44 @@ class RegenerateProductUrl
      */
     private $regeneratedCount = 0;
 
+    /**
+     * @var EventManager\Proxy
+     */
+    private $eventManager;
+
+    /**
+     * @var CacheContextFactory
+     */
+    private $cacheContextFactory;
+
+    /**
+     * @var int
+     */
+    private $limitProductInvalidateCache;
+
     public function __construct(
         CollectionFactory $collectionFactory,
         ProductUrlRewriteGenerator\Proxy $urlRewriteGenerator,
         UrlPersistInterface\Proxy $urlPersist,
-        StoreManagerInterface\Proxy $storeManager
+        StoreManagerInterface\Proxy $storeManager,
+        EventManager\Proxy $eventManager,
+        CacheContextFactory $cacheContextFactory,
+        int $limitProductInvalidateCache = 10000
     ) {
         $this->collectionFactory = $collectionFactory;
         $this->urlRewriteGenerator = $urlRewriteGenerator;
         $this->urlPersist = $urlPersist;
         $this->storeManager = $storeManager;
+        $this->eventManager = $eventManager;
+        $this->cacheContextFactory = $cacheContextFactory;
+        $this->limitProductInvalidateCache = $limitProductInvalidateCache;
     }
 
     /**
      * @param int[] $productIds
      * @param int $storeId
      * @return void
-     * @throws \Magento\Framework\Exception\NoSuchEntityException
+     * @throws NoSuchEntityException
      */
     public function execute(array $productIds, int $storeId)
     {
@@ -76,7 +103,7 @@ class RegenerateProductUrl
                 ->setStoreId($store->getId())
                 ->addStoreFilter($store->getId())
                 ->addAttributeToSelect('name')
-                ->addFieldToFilter('status', ['eq' => \Magento\Catalog\Model\Product\Attribute\Source\Status::STATUS_ENABLED])
+                ->addFieldToFilter('status', ['eq' => Status::STATUS_ENABLED])
                 ->addFieldToFilter('visibility', ['gt' => Visibility::VISIBILITY_NOT_VISIBLE]);
 
             if (!empty($productIds)) {
@@ -85,8 +112,9 @@ class RegenerateProductUrl
 
             $this->collection->addAttributeToSelect(['url_path', 'url_key']);
             $list = $this->collection->load();
+            $productIdsInvalidateCache = [];
 
-            /** @var \Magento\Catalog\Model\Product $product */
+            /** @var Product $product */
             foreach ($list as $product) {
                 $this->log('Regenerating urls for ' . $product->getSku() . ' (' . $product->getId() . ') in store ' . $store->getName());
                 $product->setStoreId($store->getId());
@@ -102,12 +130,22 @@ class RegenerateProductUrl
                 try {
                     $this->urlPersist->replace($newUrls);
                     $regeneratedForStore += count($newUrls);
-                } catch (\Exception $e) {
+                } catch (Exception $e) {
                     $this->log(sprintf('<error>Duplicated url for store ID %d, product %d (%s) - %s Generated URLs:' . PHP_EOL . '%s</error>' . PHP_EOL, $store->getId(), $product->getId(), $product->getSku(), $e->getMessage(), implode(PHP_EOL, array_keys($newUrls))));
                 }
+
+                $productIdsInvalidateCache[] = $product->getId();
+                if (count($productIdsInvalidateCache) > $this->limitProductInvalidateCache) {
+                    $this->invalidateCache($productIdsInvalidateCache);
+                    $productIdsInvalidateCache = [];
+                }
             }
+
             $this->log('Done regenerating. Regenerated ' . $regeneratedForStore . ' urls for store ' . $store->getName());
             $this->regeneratedCount += $regeneratedForStore;
+            if (count($productIdsInvalidateCache) > 0) {
+                $this->invalidateCache($productIdsInvalidateCache);
+            }
         }
     }
 
@@ -119,6 +157,29 @@ class RegenerateProductUrl
     public function getRegeneratedCount(): int
     {
         return $this->regeneratedCount;
+    }
+
+    /**
+     * Invalidate product cache
+     *
+     * @param array $productIds Id list
+     *
+     * @return bool
+     */
+    public function invalidateCache(array $productIds)
+    {
+        $cacheContext = $this->cacheContextFactory->create();
+        $cacheContext->registerEntities(Product::CACHE_TAG, $productIds);
+
+        try {
+            $this->eventManager->dispatch('clean_cache_by_tags', ['object' => $cacheContext]);
+
+            return true;
+        } catch (Exception $e) {
+            $this->log(sprintf('<error>Invalidate cache error : %s</error>' . PHP_EOL, $e->getMessage()));
+        }
+
+        return false;
     }
 
     private function log(string $message)
